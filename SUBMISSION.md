@@ -1,0 +1,2 @@
+**Rejected AI suggestions**
+1. File Structure: Gemini proposde a file structure where routes are split into multiple different files, I reject this because it adds unnecessary complexity since the application only needs a few routes.
