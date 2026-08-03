@@ -1,31 +1,134 @@
 import re
 
 from diffrev.processDiff.base import BaseProvider
-from diffrev.processDiff.diffparse import FileSection, LineRecord, parse_diff
+
+FILE_HEADER_RE = re.compile(r"^\+\+\+ (\S+)")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+# One line inside a file's diff: (line number in the new file, content, was it added).
+# One file's worth of diff: (path, its line records).
 
 CREDENTIAL_RE = re.compile(
     r"(api[_-]?key|secret|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
     re.IGNORECASE,
 )
 CATCH_RE = re.compile(r"\bcatch\b")
-SQL_KEYWORDS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+SQL_KEYWORD_RE = re.compile(r"\b(select|insert|update|delete)\b", re.IGNORECASE)
 INJECTION_PHRASES = ("ignore previous instructions", "disregard all prior", "you are now")
 
 
 class MockProvider(BaseProvider):
+    """Deterministic rule-based provider. No model is called."""
+
     name = "mock"
 
-    async def review(self, diff: str) -> list[dict]:
-        findings: list[dict] = []
-        for section in parse_diff(diff):
-            findings.extend(_scan_section(section))
+    async def analyze(self, chunk):
+        findings = []
+        for path, lines in iter_sections(chunk):
+            findings.extend(scan_section(path, lines))
         return findings
 
 
-def _finding(rule_id: str, severity: str, category: str, title: str,
-             path: str, line: int, evidence: str) -> dict:
+def iter_sections(diff):
+    """Split a unified diff into (path, [(new_line_number, content, added)]) sections.
+
+    Hunk headers declare how many lines follow, so `+`/`-` content that looks
+    like a file header (e.g. an added line starting with `++`) is never
+    mistaken for a new file.
+    """
+    sections = []
+    path = None
+    lines = []
+    new_counter = 0
+    remaining_old = 0
+    remaining_new = 0
+
+    for line in diff.splitlines():
+        if remaining_old or remaining_new:
+            if line.startswith("-"):
+                remaining_old -= 1
+            elif line.startswith("+"):
+                lines.append((new_counter, line[1:], True))
+                remaining_new -= 1
+                new_counter += 1
+            elif line.startswith(" "):
+                lines.append((new_counter, line[1:], False))
+                remaining_old -= 1
+                remaining_new -= 1
+                new_counter += 1
+            continue
+
+        header = FILE_HEADER_RE.match(line)
+        if header:
+            if path is not None:
+                sections.append((path, lines))
+            name = header.group(1)
+            if name.startswith("b/"):
+                name = name[2:]
+            path = None if name == "/dev/null" else name
+            lines = []
+            new_counter = 0
+            continue
+
+        if path is None:
+            continue
+
+        if line.startswith("\\"):
+            continue
+
+        hunk = HUNK_RE.match(line)
+        if hunk:
+            new_counter = int(hunk.group(3))
+            remaining_old = int(hunk.group(2) or 1)
+            remaining_new = int(hunk.group(4) or 1)
+
+    if path is not None:
+        sections.append((path, lines))
+    return sections
+
+
+def string_spans(line):
+    """Return (start, end) ranges of the quoted string literals in `line`."""
+    spans = []
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if char in ('"', "'"):
+            quote = char
+            start = i
+            i += 1
+            while i < len(line):
+                current = line[i]
+                if current == "\\":
+                    i += 2
+                    continue
+                if current == quote:
+                    spans.append((start, i + 1))
+                    break
+                i += 1
+        i += 1
+    return spans
+
+
+def is_sql_concat(line):
+    """True when a SQL keyword sits inside a quoted string that is joined
+    with a `+` concatenation (the `+` sits outside any string literal)."""
+    spans = string_spans(line)
+    if not spans:
+        return False
+    for i, char in enumerate(line):
+        if char == "+" and not any(start <= i < end for start, end in spans):
+            match = SQL_KEYWORD_RE.search(line)
+            while match:
+                if any(start <= match.start() < end for start, end in spans):
+                    return True
+                match = SQL_KEYWORD_RE.search(line, match.end())
+            return False
+    return False
+
+
+def finding(rule_id, severity, category, title, path, line, evidence):
     return {
-        "id": f"{rule_id}:{path}:{line}",
         "ruleId": rule_id,
         "path": path,
         "line": line,
@@ -36,56 +139,57 @@ def _finding(rule_id: str, severity: str, category: str, title: str,
     }
 
 
-def _scan_section(section: FileSection) -> list[dict]:
-    findings: list[dict] = []
-    for i, rec in enumerate(section.lines):
-        if not rec.added:
+def scan_section(path, lines):
+    findings = []
+    for i, (number, content, added) in enumerate(lines):
+        if not added:
             continue
-        content = rec.content
 
         if "eval(" in content:
-            findings.append(_finding("MOCK-001", "critical", "security", "eval usage",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-001", "critical", "security", "eval usage",
+                                     path, number, content))
         if CREDENTIAL_RE.search(content):
-            findings.append(_finding("MOCK-002", "critical", "security", "hardcoded credential",
-                                     section.path, rec.number, content))
-        if "+" in content and any(kw in content.upper() for kw in SQL_KEYWORDS):
-            findings.append(_finding("MOCK-003", "high", "security", "SQL string concatenation",
-                                     section.path, rec.number, content))
-        if CATCH_RE.search(content) and _is_empty_catch(section.lines, i):
-            findings.append(_finding("MOCK-004", "high", "correctness", "swallowed exception",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-002", "critical", "security", "hardcoded credential",
+                                     path, number, content))
+        if is_sql_concat(content):
+            findings.append(finding("MOCK-003", "high", "security", "SQL string concatenation",
+                                     path, number, content))
+        if CATCH_RE.search(content) and is_empty_catch(lines, i):
+            findings.append(finding("MOCK-004", "high", "correctness", "swallowed exception",
+                                     path, number, content))
         if "== null" in content or "!= null" in content:
-            findings.append(_finding("MOCK-005", "medium", "correctness", "loose null comparison",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-005", "medium", "correctness", "loose null comparison",
+                                     path, number, content))
         if "JSON.parse(JSON.stringify(" in content:
-            findings.append(_finding("MOCK-006", "medium", "performance", "deep-clone via JSON",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-006", "medium", "performance", "deep-clone via JSON",
+                                     path, number, content))
         if "console.log(" in content:
-            findings.append(_finding("MOCK-007", "low", "style", "console.log left in",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-007", "low", "style", "console.log left in",
+                                     path, number, content))
         if "TODO" in content or "FIXME" in content:
-            findings.append(_finding("MOCK-008", "low", "style", "unresolved marker",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-008", "low", "style", "unresolved marker",
+                                     path, number, content))
         lowered = content.lower()
         if any(phrase in lowered for phrase in INJECTION_PHRASES):
-            findings.append(_finding("MOCK-INJ", "critical", "security", "prompt-injection content",
-                                     section.path, rec.number, content))
+            findings.append(finding("MOCK-INJ", "critical", "security", "prompt-injection content",
+                                     path, number, content))
 
     return findings
 
 
-def _is_empty_catch(lines: list[LineRecord], start: int) -> bool:
+def is_empty_catch(lines, start):
     """True when the catch block opened at `start` contains no code before its close."""
     idx = start
-    brace = lines[idx].content.find("{", lines[idx].content.find("catch"))
+    content = lines[idx][1]
+    brace = content.find("{", content.find("catch"))
     while brace == -1:
         idx += 1
         if idx >= len(lines):
             return False
-        brace = lines[idx].content.find("{")
+        content = lines[idx][1]
+        brace = content.find("{")
 
-    text = lines[idx].content
+    text = content
     pos = brace
     depth = 0
     saw_content = False
@@ -104,5 +208,5 @@ def _is_empty_catch(lines: list[LineRecord], start: int) -> bool:
         idx += 1
         if idx >= len(lines):
             return False
-        text = lines[idx].content
+        text = lines[idx][1]
         pos = 0

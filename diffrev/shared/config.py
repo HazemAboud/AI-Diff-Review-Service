@@ -1,0 +1,13 @@
+from diffrev.processDiff.chunking import DEFAULT_CHUNK_BYTES
+
+MAX_PAYLOAD_BYTES = 1048576
+CHUNK_BYTES = DEFAULT_CHUNK_BYTES
+MAX_CONCURRENT_JOBS = 4
+RATE_LIMIT_PER_MINUTE = 30
+
+SPEC_LIMITS = {
+    "maxPayloadBytes": MAX_PAYLOAD_BYTES,
+    "chunkBytes": CHUNK_BYTES,
+    "maxConcurrentJobs": MAX_CONCURRENT_JOBS,
+    "rateLimitPerMinute": RATE_LIMIT_PER_MINUTE,
+}

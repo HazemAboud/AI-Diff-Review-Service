@@ -6,12 +6,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   input_bytes     INT UNSIGNED  NOT NULL,
   chunks          INT UNSIGNED  NOT NULL DEFAULT 0,
   body_hash       CHAR(64)      NOT NULL,
-  cacheHit        BOOL			DEFAULT FALSE,
   error_message   TEXT          NULL,
   created_at      DATETIME(6)   NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   started_at      DATETIME(6)   NULL,
   finished_at     DATETIME(6)   NULL,
   PRIMARY KEY (job_id),
+  UNIQUE KEY uk_body_hash (body_hash),
   KEY idx_body_hash_status (body_hash, status),
   KEY idx_queue (status, created_at)
 );
@@ -20,7 +20,17 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   idem_key  VARCHAR(255)  NOT NULL,
   job_id    CHAR(36)      NOT NULL,
   PRIMARY KEY (idem_key),
-  CONSTRAINT fk_idem_job FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+  KEY idx_idem_job (job_id)
+);
+
+CREATE TABLE IF NOT EXISTS cache_hits (
+  job_id         CHAR(36)     NOT NULL,
+  source_job_id  CHAR(36)     NOT NULL,
+  input_bytes    INT UNSIGNED NOT NULL,
+  created_at     DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (job_id),
+  KEY idx_cache_hits_source (source_job_id),
+  CONSTRAINT fk_cache_hits_source FOREIGN KEY (source_job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
